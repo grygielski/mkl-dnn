@@ -1009,38 +1009,51 @@ static inline void set_thread_opts_nopack(int nthrs,
         }
     }
 
-    // If A or B offset are non-zero, we need to keep 1D_copya to reduce
-    // update overhead for integer case.
-    if (isInteger && (arg->ao != 0 || arg->bo != 0)) {
-        condition_2D_bsrc = false;
-        condition_1D_copya = true;
-    }
-
     // If A offset is non-zero, we use to keep 1D_copya.
     // TODO: the reasons seems to be in copy_sum_bx routines. At least,
     //       after simple optimization of copy_sum_ax, similar restriction
     //       on offset B became unnecessary. Revisit.
     if (isInteger && arg->ao != 0) {
-        condition_2D_bsrc = 0;
-        condition_1D_copya = 1;
+        condition_2D_bsrc = false;
+        condition_1D_copya = true;
     }
 
     if (condition_2D_bsrc) {
         int nthrs_m = 1;
         int nthrs_n = nthrs;
 
-        while ((!isSgemm && (nthrs_n > 1) && (n / nthrs_n < arg->un)
-                       && (m / nthrs_m >= 2 * arg->um))
-                || ((nthrs_n % 2 == 0)
-                        && (n / nthrs > N2D_MAX || n / nthrs_n <= N2D_MAX / 2)
-                        && (m / nthrs_m >= 2 * M2D_MIN) && (nthrs_m < 4))) {
-            nthrs_m *= 2;
-            nthrs_n /= 2;
+        if (isSgemm) {
+            while ((nthrs_n % 2 == 0)
+                    && (n / nthrs > N2D_MAX || n / nthrs_n <= N2D_MAX / 2)
+                    && (m / nthrs_m >= 2 * M2D_MIN) && (nthrs_m < 4)) {
+                nthrs_m *= 2;
+                nthrs_n /= 2;
+            }
+
+            thread_info.nthrs_m = nthrs_m;
+            thread_info.nthrs_n = nthrs_n;
+            thread_info.partition = partition_type::col_major_2d;
+        } else {
+            if (n <= 64 || n >= 256) {
+                while (((nthrs_n > 1) && (n / nthrs_n < arg->un)
+                            && (m / nthrs_m >= 2 * arg->um))
+                        || ((nthrs_n % 2 == 0)
+                            && (n / nthrs > N2D_MAX ||
+                                n / nthrs_n <= N2D_MAX / 2)
+                            && (m / nthrs_m >= 2 * M2D_MIN) && (nthrs_m < 4))) {
+                    nthrs_m *= 2;
+                    nthrs_n /= 2;
+                }
+
+                thread_info.nthrs_m = nthrs_m;
+                thread_info.nthrs_n = nthrs_n;
+                thread_info.partition = partition_type::col_major_2d;
+            } else {
+                // Use 3D decompostition from pack api without k-partitioning.
+                set_thread_opts_pack(nthrs, thread_info, arg, false);
+            }
         }
 
-        thread_info.nthrs_m = nthrs_m;
-        thread_info.nthrs_n = nthrs_n;
-        thread_info.partition = partition_type::col_major_2d;
     } else if (condition_1D_copya && mkldnn_thr_syncable()) {
         // Use parallel copy A algorithm
         thread_info.copy = copy_type::shared_a;
@@ -1065,7 +1078,8 @@ static inline void set_thread_opts_nopack(int nthrs,
 template <typename a_type, typename b_type, typename c_type>
 static inline void set_thread_opts_pack(int nthrs,
         gemm_threading_t &thread_info,
-        const gemm_info_t<a_type, b_type, c_type> *arg) {
+        const gemm_info_t<a_type, b_type, c_type> *arg,
+        bool do_k_blocking = true) {
 
     constexpr bool is_int8 = (data_traits<a_type>::data_type == data_type::s8);
 
@@ -1114,7 +1128,7 @@ static inline void set_thread_opts_pack(int nthrs,
     };
 
     // Choose k blocking.
-    if ((m / MBLK + n / NBLK) < nthrs)
+    if ((m / MBLK + n / NBLK) < nthrs && do_k_blocking)
         for (int nk = 1; nk <= 4 && k >= ((KBLK + 1) * nk); nk++)
             if (nthrs % nk == 0) nthr_k = nk;
 
